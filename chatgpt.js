@@ -16,6 +16,47 @@ function buildCheckoutPayload(planName, country, currency) {
     };
 }
 
+// 部署校验标记：日志出现该版本号即代表新代码已生效
+const CHECKOUT_IMPL_VERSION = 'v4-page-tls-device';
+
+/**
+ * 页面内发起 Checkout 请求（对齐官方接口契约）
+ *
+ * 官方前端从 chatgpt.com 页面内部用 fetch 调用该端点，因此请求带：
+ * 真实 Chrome TLS 指纹 + 真实 Origin/Referer/User-Agent/sec-ch-ua 头 + 真实 Cookie。
+ * 这些都无法在 Node 侧（context.request / axios）伪造，只有页面内 fetch 能天然满足。
+ * 同时补上设备绑定 oai-device-id / oai-language / oai-session-id。
+ */
+async function createCheckoutViaPage(page, payload, accessToken, deviceId) {
+    const token = String(accessToken || '').trim();
+    const did = String(deviceId || '').trim();
+    const sessionId = randomUUID();
+    return page.evaluate(async (args) => {
+        try {
+            const headers = {
+                'Content-Type': 'application/json',
+                Accept: '*/*',
+                'oai-language': 'en-US',
+                'oai-session-id': args.sessionId,
+                'x-openai-target-path': '/backend-api/payments/checkout',
+                'x-openai-target-route': '/backend-api/payments/checkout'
+            };
+            if (args.token) headers.Authorization = `Bearer ${args.token}`;
+            if (args.deviceId) headers['oai-device-id'] = args.deviceId;
+            const res = await fetch('https://chatgpt.com/backend-api/payments/checkout', {
+                method: 'POST',
+                headers,
+                credentials: 'include',
+                body: JSON.stringify(args.payload)
+            });
+            const text = await res.text();
+            return { transport: 'page', ok: true, status: res.status, text };
+        } catch (e) {
+            return { transport: 'page', ok: false, error: String((e && e.message) || e) };
+        }
+    }, { payload, token, deviceId: did, sessionId });
+}
+
 function formatApiErrorDetail(detail, fallback = '') {
     if (detail == null || detail === '') return fallback;
     if (typeof detail === 'string') return detail;
@@ -417,7 +458,33 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
     }
 
     const gpt = new ChatGPTService(page.context().request, token, { deviceId });
-    const checkout = await gpt.createCheckoutSession(planType, region, billingCurrency, planNameOverride);
+    const planName = String(planNameOverride || store.resolvePlanName(planType)).trim();
+    const payload = buildCheckoutPayload(planName, region, billingCurrency);
+    console.log(`[ChatGPT] Checkout 实现版本: ${CHECKOUT_IMPL_VERSION} (transport=page, 真实 TLS)`);
+
+    let checkout = null;
+    // 首选：页面内 fetch → 真实 Chrome TLS + 真实浏览器头（官方接口契约）
+    const inPage = await createCheckoutViaPage(page, payload, token, deviceId);
+    if (inPage.ok) {
+        const parsed = parseCheckoutApiResponse(inPage.status, inPage.text);
+        if (parsed.ok) {
+            console.log(`✅ 订单创建成功 (session: ${parsed.sessionId ? parsed.sessionId.slice(0, 24) + '...' : 'unknown'})`);
+            checkout = { sessionId: parsed.sessionId, checkoutUrl: parsed.checkoutUrl };
+        } else {
+            // 风控/业务拒绝：不回退重发，避免叠加风险标记
+            console.error(`[-] 订单创建失败 (Status: ${parsed.status}, transport=page)`);
+            console.error(`    响应: ${parsed.error}`);
+            checkout = { sessionId: null, checkoutUrl: null, error: parsed.error };
+        }
+    } else {
+        console.warn(`[Warn] 页面内 fetch 异常，回退 Node 请求: ${inPage.error}`);
+    }
+
+    // 回退：Node 侧请求（仅在页面内请求本身抛错时使用）
+    if (!checkout) {
+        checkout = await gpt.createCheckoutSession(planType, region, billingCurrency, planNameOverride);
+    }
+
     if (!checkout.checkoutUrl) {
         throw new Error(`API 创建 Checkout 失败: ${checkout.error || '未返回 data.url'}`);
     }
