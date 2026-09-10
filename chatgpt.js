@@ -42,7 +42,7 @@ function buildCheckoutPayload(planName, country, currency) {
 }
 
 // 部署校验标记：日志出现该版本号即代表新代码已生效
-const CHECKOUT_IMPL_VERSION = 'v2-inpage-fetch';
+const CHECKOUT_IMPL_VERSION = 'v3-device-headers';
 
 /**
  * 在真实浏览器页面内发起 Checkout 请求（关键修复）
@@ -54,16 +54,22 @@ const CHECKOUT_IMPL_VERSION = 'v2-inpage-fetch';
  * 改为页面内 fetch 后，请求走 Chromium 真实网络栈，自动获得：
  * 真实 TLS/H2 指纹、真实 Referer/Origin/sec-fetch 头、真实 cookie（含 cf_clearance）
  */
-async function createCheckoutViaPage(page, payload, accessToken) {
+async function createCheckoutViaPage(page, payload, accessToken, deviceId) {
     const token = String(accessToken || '').trim();
+    const did = String(deviceId || '').trim();
     return page.evaluate(async (args) => {
         try {
+            // 对齐 ChatGPT 前端 fetch 包装器：真实 App 调用 backend-api 时会带上 oai-device-id / oai-language
             const headers = {
                 'Content-Type': 'application/json',
-                Accept: 'application/json'
+                Accept: 'application/json',
+                'oai-language': 'en-US'
             };
             if (args.token) {
                 headers.Authorization = `Bearer ${args.token}`;
+            }
+            if (args.deviceId) {
+                headers['oai-device-id'] = args.deviceId;
             }
             const res = await fetch('https://chatgpt.com/backend-api/payments/checkout', {
                 method: 'POST',
@@ -72,11 +78,16 @@ async function createCheckoutViaPage(page, payload, accessToken) {
                 body: JSON.stringify(args.payload)
             });
             const text = await res.text();
-            return { transport: 'page', ok: true, status: res.status, text };
+            // 回传响应头用于判断是 Cloudflare Bot Management 还是 OpenAI 应用层风控
+            const respHeaders = {};
+            try {
+                res.headers.forEach((value, key) => { respHeaders[String(key).toLowerCase()] = value; });
+            } catch (_) { /* 忽略 */ }
+            return { transport: 'page', ok: true, status: res.status, text, headers: respHeaders };
         } catch (e) {
             return { transport: 'page', ok: false, error: String((e && e.message) || e) };
         }
-    }, { payload, token });
+    }, { payload, token, deviceId: did });
 }
 
 /**
@@ -477,11 +488,20 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
 
     let checkout = null;
 
+    // 设备标识：真实 App 每次 backend-api 调用都会带 oai-device-id，缺失本身就是异常信号
+    let deviceId = '';
+    try {
+        const cookies = await page.context().cookies('https://chatgpt.com').catch(() => []);
+        const oaiDid = (cookies || []).find((c) => c.name === 'oai-did');
+        if (oaiDid && oaiDid.value) deviceId = oaiDid.value;
+    } catch (_) { /* 忽略，缺失 oai-did 不致命 */ }
+    console.log(`[ChatGPT] oai-did: ${deviceId ? deviceId.slice(0, 8) + '...' : '未找到（将不带 oai-device-id 发送）'}`);
+
     // --- 首选：页面内 fetch，走 Chromium 真实网络栈（TLS/H2 指纹真实） ---
     if (requestMode !== 'node') {
         await warmupPricingPage(page);
         console.log(`[ChatGPT] 创建 Checkout Session(页面内 fetch): plan_name=${planName}, country=${region}, currency=${billingCurrency}, checkout_ui_mode=${payload.checkout_ui_mode}`);
-        const inPage = await createCheckoutViaPage(page, payload, token);
+        const inPage = await createCheckoutViaPage(page, payload, token, deviceId);
 
         if (inPage.ok) {
             const parsed = parseCheckoutApiResponse(inPage.status, inPage.text);
@@ -492,6 +512,12 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
                 // 风控/业务拒绝：不再回退重发，避免叠加风险标记
                 console.error(`[-] 订单创建失败 (Status: ${parsed.status}, transport=page)`);
                 console.error(`    响应: ${parsed.error}`);
+                const h = inPage.headers || {};
+                const interesting = ['cf-mitigated', 'cf-ray', 'cf-cache-status', 'x-request-id', 'server', 'content-type']
+                    .map((k) => (h[k] ? `${k}=${h[k]}` : null)).filter(Boolean);
+                console.error(`    拦截层: ${h['cf-mitigated'] ? 'Cloudflare Bot Management (cf-mitigated)' : (h['cf-ray'] ? '经 Cloudflare 但无 mitigated 头 → OpenAI 应用层风控' : '未见 Cloudflare 头 → OpenAI 应用层风控')}`);
+                console.error(`    响应头: ${interesting.join(', ') || '(无诊断头)'}`);
+                console.error(`    当前页面: ${String(page.url() || '').slice(0, 120)}`);
                 checkout = { sessionId: null, checkoutUrl: null, error: parsed.error };
             }
         } else {
@@ -501,13 +527,6 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
 
     // --- 回退：Node 侧请求（旧实现，仅在页面内请求本身抛错时使用） ---
     if (!checkout) {
-        let deviceId = '';
-        try {
-            const cookies = await page.context().cookies('https://chatgpt.com').catch(() => []);
-            const oaiDid = (cookies || []).find((c) => c.name === 'oai-did');
-            if (oaiDid && oaiDid.value) deviceId = oaiDid.value;
-        } catch (_) { /* 忽略，缺失 oai-did 不致命 */ }
-
         const gpt = new ChatGPTService(page.context().request, token, { deviceId });
         checkout = await gpt.createCheckoutSession(planType, region, billingCurrency, planNameOverride);
     }
