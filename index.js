@@ -516,6 +516,22 @@ async function run() {
             console.warn(`⚠️ [系统] 当前页面已关闭，关闭前最后 URL: ${page.url()}`);
         });
 
+        // 抓取前端发 /backend-api/payments/checkout 的真实请求头（诊断用，CAPTURE_CHECKOUT_HEADERS=1 开启）
+        if (process.env.CAPTURE_CHECKOUT_HEADERS === '1') {
+            page.on('request', (req) => {
+                if (/\/backend-api\/payments\/checkout(\?|$)/.test(req.url())) {
+                    const h = req.headers();
+                    console.log('[HeaderCapture] ===== /payments/checkout 请求头 =====');
+                    for (const key of Object.keys(h).sort()) {
+                        const v = String(h[key] || '');
+                        console.log(`[HeaderCapture] ${key}: ${v.length > 200 ? v.slice(0, 200) + `...(${v.length})` : v}`);
+                    }
+                    console.log('[HeaderCapture] ===== 结束 =====');
+                }
+            });
+            console.log('[HeaderCapture] checkout 请求头抓取已开启');
+        }
+
         const loginInfo = await bootstrapChatGptSession(page, sessionRaw, { sessionData, cookieVerified });
         if (loginInfo.email && !email) {
             console.log(`[Info] 账号邮箱: ${loginInfo.email}`);
