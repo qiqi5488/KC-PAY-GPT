@@ -41,6 +41,61 @@ function buildCheckoutPayload(planName, country, currency) {
     };
 }
 
+// 部署校验标记：日志出现该版本号即代表新代码已生效
+const CHECKOUT_IMPL_VERSION = 'v2-inpage-fetch';
+
+/**
+ * 在真实浏览器页面内发起 Checkout 请求（关键修复）
+ *
+ * 为什么必须这样做：Playwright 的 context.request 由 Node.js 进程发出，
+ * TLS(JA3/JA4) 与 HTTP/2 帧指纹均为 Node 客户端特征，无法用 HTTP 头伪造。
+ * OpenAI 风控在网络层即可识别「自称 Chrome 但握手是 Node」→ 返回 400 unusual activity。
+ *
+ * 改为页面内 fetch 后，请求走 Chromium 真实网络栈，自动获得：
+ * 真实 TLS/H2 指纹、真实 Referer/Origin/sec-fetch 头、真实 cookie（含 cf_clearance）
+ */
+async function createCheckoutViaPage(page, payload, accessToken) {
+    const token = String(accessToken || '').trim();
+    return page.evaluate(async (args) => {
+        try {
+            const headers = {
+                'Content-Type': 'application/json',
+                Accept: 'application/json'
+            };
+            if (args.token) {
+                headers.Authorization = `Bearer ${args.token}`;
+            }
+            const res = await fetch('https://chatgpt.com/backend-api/payments/checkout', {
+                method: 'POST',
+                headers,
+                credentials: 'include',
+                body: JSON.stringify(args.payload)
+            });
+            const text = await res.text();
+            return { transport: 'page', ok: true, status: res.status, text };
+        } catch (e) {
+            return { transport: 'page', ok: false, error: String((e && e.message) || e) };
+        }
+    }, { payload, token });
+}
+
+/**
+ * 真实感预热：把页面停在定价页，使 Referer/Origin 与真实用户点击升级时一致
+ */
+async function warmupPricingPage(page) {
+    if (String(process.env.CHECKOUT_PAGE_WARMUP || '1') === '0') {
+        return;
+    }
+    try {
+        if (!/chatgpt\.com\/(pricing|#pricing)/.test(page.url())) {
+            await page.goto('https://chatgpt.com/pricing', { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.waitForTimeout(1200 + Math.floor(Math.random() * 900));
+        }
+    } catch (_) {
+        // 预热失败不阻断主流程
+    }
+}
+
 function formatApiErrorDetail(detail, fallback = '') {
     if (detail == null || detail === '') return fallback;
     if (typeof detail === 'string') return detail;
@@ -415,16 +470,48 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
     const billingCurrency = String(currency || getRegionConfig(region)?.currency || 'PHP').toUpperCase();
     console.log(`🧭 [步骤] 正在通过 API 创建 Checkout (country=${region}, currency=${billingCurrency}, plan=${planType})...`);
 
-    // 从浏览器 context 提取 oai-did 设备标识，随请求头一同发送，维持设备一致性
-    let deviceId = '';
-    try {
-        const cookies = await page.context().cookies('https://chatgpt.com').catch(() => []);
-        const oaiDid = (cookies || []).find((c) => c.name === 'oai-did');
-        if (oaiDid && oaiDid.value) deviceId = oaiDid.value;
-    } catch (_) { /* 忽略，缺失 oai-did 不致命 */ }
+    const planName = String(planNameOverride || store.resolvePlanName(planType)).trim();
+    const payload = buildCheckoutPayload(planName, region, billingCurrency);
+    const requestMode = String(process.env.CHECKOUT_REQUEST_MODE || 'page').toLowerCase();
+    console.log(`[ChatGPT] Checkout 实现版本: ${CHECKOUT_IMPL_VERSION} (transport=${requestMode})`);
 
-    const gpt = new ChatGPTService(page.context().request, token, { deviceId });
-    const checkout = await gpt.createCheckoutSession(planType, region, billingCurrency, planNameOverride);
+    let checkout = null;
+
+    // --- 首选：页面内 fetch，走 Chromium 真实网络栈（TLS/H2 指纹真实） ---
+    if (requestMode !== 'node') {
+        await warmupPricingPage(page);
+        console.log(`[ChatGPT] 创建 Checkout Session(页面内 fetch): plan_name=${planName}, country=${region}, currency=${billingCurrency}, checkout_ui_mode=${payload.checkout_ui_mode}`);
+        const inPage = await createCheckoutViaPage(page, payload, token);
+
+        if (inPage.ok) {
+            const parsed = parseCheckoutApiResponse(inPage.status, inPage.text);
+            if (parsed.ok) {
+                console.log(`✅ 订单创建成功 (session: ${parsed.sessionId ? parsed.sessionId.slice(0, 24) + '...' : 'unknown'})`);
+                checkout = { sessionId: parsed.sessionId, checkoutUrl: parsed.checkoutUrl };
+            } else {
+                // 风控/业务拒绝：不再回退重发，避免叠加风险标记
+                console.error(`[-] 订单创建失败 (Status: ${parsed.status}, transport=page)`);
+                console.error(`    响应: ${parsed.error}`);
+                checkout = { sessionId: null, checkoutUrl: null, error: parsed.error };
+            }
+        } else {
+            console.warn(`[Warn] 页面内 fetch 异常，回退 Node 请求: ${inPage.error}`);
+        }
+    }
+
+    // --- 回退：Node 侧请求（旧实现，仅在页面内请求本身抛错时使用） ---
+    if (!checkout) {
+        let deviceId = '';
+        try {
+            const cookies = await page.context().cookies('https://chatgpt.com').catch(() => []);
+            const oaiDid = (cookies || []).find((c) => c.name === 'oai-did');
+            if (oaiDid && oaiDid.value) deviceId = oaiDid.value;
+        } catch (_) { /* 忽略，缺失 oai-did 不致命 */ }
+
+        const gpt = new ChatGPTService(page.context().request, token, { deviceId });
+        checkout = await gpt.createCheckoutSession(planType, region, billingCurrency, planNameOverride);
+    }
+
     if (!checkout.checkoutUrl) {
         throw new Error(`API 创建 Checkout 失败: ${checkout.error || '未返回 data.url'}`);
     }
