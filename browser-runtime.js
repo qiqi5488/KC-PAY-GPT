@@ -8,6 +8,12 @@ const { connectStandaloneBrowser } = require('./browser-standalone');
 const { connectPoolBrowser } = require('./browser-pool-client');
 
 function resolveBrowserRuntimeMode(env = process.env) {
+    // 外部指纹浏览器直连优先：设置了 EXTERNAL_BROWSER_CDP_URL 即进入外部模式。
+    // 必须放在 BROWSER_RUNTIME_MODE 判断之前——server 的 buildWorkerRuntimeEnv
+    // 会强制写 BROWSER_RUNTIME_MODE=standalone，只有在这里按该变量优先才能命中。
+    if (String(env.EXTERNAL_BROWSER_CDP_URL || '').trim()) {
+        return 'external';
+    }
     const explicit = String(env.BROWSER_RUNTIME_MODE || '').trim().toLowerCase();
     if (explicit === 'pool' || explicit === 'standalone') {
         return explicit;
@@ -25,6 +31,13 @@ function resolveBrowserRuntimeMode(env = process.env) {
 async function connectTaskBrowser(options = {}) {
     const env = options.env || process.env;
     const mode = resolveBrowserRuntimeMode(env);
+
+    if (mode === 'external') {
+        const { connectExternalBrowser } = require('./browser-external');
+        return connectExternalBrowser({
+            cdpUrl: env.EXTERNAL_BROWSER_CDP_URL
+        });
+    }
 
     if (mode === 'pool') {
         return connectPoolBrowser({
@@ -72,6 +85,15 @@ function buildWorkerRuntimeEnv(baseEnv, slot, mode) {
             BROWSER_POOL_CDP_URL: slot.cdpUrl,
             CDP_URL: slot.cdpUrl,
             CDP_PORT: String(slot.port)
+        };
+    }
+    if (mode === 'external') {
+        return {
+            ...baseEnv,
+            BROWSER_RUNTIME_MODE: 'external',
+            BROWSER_POOL: '0',
+            BROWSER_POOL_CDP_URL: '',
+            BROWSER_POOL_SLOT: ''
         };
     }
     return {

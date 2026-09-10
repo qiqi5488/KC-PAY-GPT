@@ -3100,6 +3100,12 @@ async function syncBrowserPoolModeFromStore() {
 }
 
 async function spawnWorkerWithBrowser({ jobKey, runtimeEnv, runScript }) {
+    // 外部指纹浏览器直连：EXTERNAL_BROWSER_CDP_URL 优先于池/独立模式
+    const externalCdp = String(runtimeEnv.EXTERNAL_BROWSER_CDP_URL || '').trim();
+    if (externalCdp) {
+        logTask(jobKey, `浏览器模式: 外部指纹浏览器 CDP=${externalCdp.slice(0, 80)}`);
+        return runScript(buildWorkerRuntimeEnv(runtimeEnv, null, 'external'));
+    }
     const poolEnabled = browserPool.getRuntimeEnabled();
     if (!poolEnabled) {
         logTask(jobKey, '浏览器模式: 独立启动（后台已关闭浏览器池）');

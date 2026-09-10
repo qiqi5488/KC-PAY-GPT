@@ -188,12 +188,19 @@ async function run() {
     let page = null;
     let paymentSucceeded = false;
 
-    const preparedProxy = await preparePlaywrightProxy(CONFIG.proxy);
-    proxyCleanup = preparedProxy.cleanup;
-    const proxyConfig = preparedProxy.proxyConfig;
+    // 外部指纹浏览器模式：代理由指纹浏览器 profile 自身承担，脚本不再配置/中继代理
+    const isExternalBrowser = String(process.env.EXTERNAL_BROWSER_CDP_URL || '').trim() !== '';
+    let proxyConfig = null;
+    if (isExternalBrowser) {
+        console.log('🧩 [系统] 外部指纹浏览器模式：代理由指纹浏览器自身承担，跳过脚本侧代理配置');
+    } else {
+        const preparedProxy = await preparePlaywrightProxy(CONFIG.proxy);
+        proxyCleanup = preparedProxy.cleanup;
+        proxyConfig = preparedProxy.proxyConfig;
 
-    if (proxyConfig) {
-        console.log(`🌐 [系统] 代理已配置${preparedProxy.relayed ? '（SOCKS→本地 HTTP 中继）' : ''}`);
+        if (proxyConfig) {
+            console.log(`🌐 [系统] 代理已配置${preparedProxy.relayed ? '（SOCKS→本地 HTTP 中继）' : ''}`);
+        }
     }
 
     browserSession = await connectTaskBrowser({
@@ -216,20 +223,23 @@ async function run() {
     const browserProfile = getRegionBrowserProfile(paymentRegion);
 
     const contextOptions = {
-        userAgent: realUserAgent,
         viewport,
         locale: browserProfile.locale,
         timezoneId: browserProfile.timezoneId,
         screen: { width: 1920, height: 1080 },
         deviceScaleFactor: 1,
         isMobile: false,
-        hasTouch: false,
-        extraHTTPHeaders: {
+        hasTouch: false
+    };
+    if (!isExternalBrowser) {
+        // 外部指纹浏览器自带 UA / sec-ch-ua，不覆盖以免与浏览器自身指纹冲突
+        contextOptions.userAgent = realUserAgent;
+        contextOptions.extraHTTPHeaders = {
             'sec-ch-ua': `"Not)A;Brand";v="8", "Chromium";v="${chromeMajor}", "Google Chrome";v="${chromeMajor}"`,
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Windows"'
-        }
-    };
+        };
+    }
     if (proxyConfig) {
         contextOptions.proxy = proxyConfig;
     }
@@ -248,7 +258,8 @@ async function run() {
     const sessionData = installResult?.sessionData || installResult;
     const cookieVerified = Boolean(installResult?.cookieVerified);
 
-    // ============= 指纹伪装 =============
+    // ============= 指纹伪装（外部指纹浏览器模式不注入，避免与浏览器自身指纹冲突） =============
+    if (!isExternalBrowser) {
     await context.addInitScript((injectedChromeMajor) => {
         const NavProto = Object.getPrototypeOf(navigator);
         const ScrProto = Object.getPrototypeOf(screen);
@@ -456,6 +467,7 @@ async function run() {
             }
         } catch (_) { }
     }, chromeMajor);
+    }
 
     try {
         // --- Phase 0: Proxy Connectivity Check ---
