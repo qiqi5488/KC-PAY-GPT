@@ -516,22 +516,6 @@ async function run() {
             console.warn(`⚠️ [系统] 当前页面已关闭，关闭前最后 URL: ${page.url()}`);
         });
 
-        // 抓取前端发 /backend-api/payments/checkout 的真实请求头（诊断用，CAPTURE_CHECKOUT_HEADERS=1 开启）
-        if (process.env.CAPTURE_CHECKOUT_HEADERS === '1') {
-            page.on('request', (req) => {
-                if (/\/backend-api\/payments\/checkout(\?|$)/.test(req.url())) {
-                    const h = req.headers();
-                    console.log('[HeaderCapture] ===== /payments/checkout 请求头 =====');
-                    for (const key of Object.keys(h).sort()) {
-                        const v = String(h[key] || '');
-                        console.log(`[HeaderCapture] ${key}: ${v.length > 200 ? v.slice(0, 200) + `...(${v.length})` : v}`);
-                    }
-                    console.log('[HeaderCapture] ===== 结束 =====');
-                }
-            });
-            console.log('[HeaderCapture] checkout 请求头抓取已开启');
-        }
-
         const loginInfo = await bootstrapChatGptSession(page, sessionRaw, { sessionData, cookieVerified });
         if (loginInfo.email && !email) {
             console.log(`[Info] 账号邮箱: ${loginInfo.email}`);
@@ -539,11 +523,6 @@ async function run() {
 
         // --- Phase 2: API 创建 Checkout（注入账单地区），失败时回退 UI 定价页 ---
         const checkoutMode = String(process.env.CHECKOUT_MODE || 'api').toLowerCase();
-        // 调试模式是否允许 API 失败后回退 UI 定价页（测试用 CHECKOUT_DEBUG_UI_FALLBACK=1 开启，默认关闭）
-        const debugUiFallback = process.env.CHECKOUT_DEBUG_UI_FALLBACK === '1';
-        if (debugOnly && debugUiFallback) {
-            console.log('[调试] UI 兜底已开启：API 失败后将回退到 UI 定价页流程');
-        }
         let checkoutOpened = false;
         let checkoutResult = null;
         const planNameOverride = String(CONFIG.planNameOverride || '').trim() || undefined;
@@ -563,11 +542,11 @@ async function run() {
                 checkoutOpened = true;
             } catch (apiError) {
                 console.warn(`[Warn] API Checkout 失败: ${apiError.message}`);
-                if (debugOnly && !debugUiFallback) {
+                if (debugOnly) {
                     throw apiError;
                 }
                 if (checkoutMode === 'api') {
-                    console.log(`[Info] 正在回退到 UI 定价页流程...${debugOnly ? '（调试 UI 兜底已开启）' : ''}`);
+                    console.log('[Info] 正在回退到 UI 定价页流程...');
                 } else {
                     throw apiError;
                 }
@@ -575,7 +554,7 @@ async function run() {
         }
 
         if (!checkoutOpened) {
-            if (debugOnly && !debugUiFallback) {
+            if (debugOnly) {
                 throw new Error('API Checkout 失败，调试模式不启用 UI 定价页');
             }
             console.log('🧭 [步骤] 正在打开定价页并选择升级套餐...');
