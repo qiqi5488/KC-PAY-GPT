@@ -556,7 +556,8 @@ async function run() {
                     country: billingCountry,
                     currency: billingCurrency,
                     planNameOverride,
-                    verifyPage: !debugOnly
+                    verifyPage: !debugOnly,
+                    proxyUrl: proxyConfig?.server || ''
                 });
                 checkoutOpened = true;
             } catch (apiError) {

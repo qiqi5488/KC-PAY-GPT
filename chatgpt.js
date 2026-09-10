@@ -5,6 +5,7 @@ const axios = require('axios');
 const store = require('./mysql-store');
 const { getRegionConfig } = require('./region-config');
 const { executePaymentWithRetry } = require('./payment-retry');
+const { mintSentinelToken } = require('./sentinel');
 
 function buildCheckoutPayload(planName, country, currency) {
     const uiMode = String(process.env.CHECKOUT_UI_MODE || 'custom').trim() || 'custom';
@@ -17,7 +18,34 @@ function buildCheckoutPayload(planName, country, currency) {
 }
 
 // 部署校验标记：日志出现该版本号即代表新代码已生效
-const CHECKOUT_IMPL_VERSION = 'v4-page-tls-device';
+const CHECKOUT_IMPL_VERSION = 'v5-sentinel';
+
+/**
+ * 从 chatgpt.com 页面 HTML 提取前端上下文（attestation / client-version / build-number）
+ * 这些值随每次部署动态下发，无法写死，必须实时抓取。
+ */
+async function bootstrapFrontendContext(page) {
+    try {
+        const html = await page.evaluate(async () => {
+            try {
+                const res = await fetch('https://chatgpt.com/', { credentials: 'include' });
+                return await res.text();
+            } catch (_) {
+                return document.documentElement ? document.documentElement.outerHTML : '';
+            }
+        }).catch(() => '');
+        if (!html) return {};
+        const out = {};
+        let m;
+        if ((m = html.match(/"webDeploymentAttestation"\s*:\s*"([^"]+)"/i))) out.webDeploymentAttestation = m[1];
+        if ((m = html.match(/<html[^>]+data-build="([^"]+)"/i))) out.clientVersion = m[1];
+        if ((m = html.match(/<html[^>]+data-seq="([^"]+)"/i))) out.clientBuildNumber = m[1];
+        if ((m = html.match(/"sessionId"\s*:\s*"([^"]+)"/i))) out.oaiSessionId = m[1];
+        return out;
+    } catch (_) {
+        return {};
+    }
+}
 
 /**
  * 页面内发起 Checkout 请求（对齐官方接口契约）
@@ -25,9 +53,10 @@ const CHECKOUT_IMPL_VERSION = 'v4-page-tls-device';
  * 官方前端从 chatgpt.com 页面内部用 fetch 调用该端点，因此请求带：
  * 真实 Chrome TLS 指纹 + 真实 Origin/Referer/User-Agent/sec-ch-ua 头 + 真实 Cookie。
  * 这些都无法在 Node 侧（context.request / axios）伪造，只有页面内 fetch 能天然满足。
- * 同时补上设备绑定 oai-device-id / oai-language / oai-session-id。
+ * 同时补上设备绑定 oai-device-id / oai-language / oai-session-id，
+ * 以及 Sentinel / attestation / client-version 等前端原生头（extraHeaders）。
  */
-async function createCheckoutViaPage(page, payload, accessToken, deviceId) {
+async function createCheckoutViaPage(page, payload, accessToken, deviceId, extraHeaders = {}) {
     const token = String(accessToken || '').trim();
     const did = String(deviceId || '').trim();
     const sessionId = randomUUID();
@@ -43,6 +72,9 @@ async function createCheckoutViaPage(page, payload, accessToken, deviceId) {
             };
             if (args.token) headers.Authorization = `Bearer ${args.token}`;
             if (args.deviceId) headers['oai-device-id'] = args.deviceId;
+            if (args.extraHeaders && typeof args.extraHeaders === 'object') {
+                Object.assign(headers, args.extraHeaders);
+            }
             const res = await fetch('https://chatgpt.com/backend-api/payments/checkout', {
                 method: 'POST',
                 headers,
@@ -54,7 +86,7 @@ async function createCheckoutViaPage(page, payload, accessToken, deviceId) {
         } catch (e) {
             return { transport: 'page', ok: false, error: String((e && e.message) || e) };
         }
-    }, { payload, token, deviceId: did, sessionId });
+    }, { payload, token, deviceId: did, sessionId, extraHeaders });
 }
 
 function formatApiErrorDetail(detail, fallback = '') {
@@ -433,7 +465,7 @@ async function assertCheckoutPageReady(page) {
 /**
  * 通过 API 注入 billing_details 创建 Checkout，并打开 chatgpt.com/checkout
  */
-async function openApiCheckout(page, { accessToken, planType, country, currency, planNameOverride, verifyPage = true }) {
+async function openApiCheckout(page, { accessToken, planType, country, currency, planNameOverride, verifyPage = true, proxyUrl = '' }) {
     const { assertChatGptLoggedIn } = require('./session-auth');
     const token = String(accessToken || '').trim();
     if (!token) {
@@ -444,13 +476,16 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
     const billingCurrency = String(currency || getRegionConfig(region)?.currency || 'PHP').toUpperCase();
     console.log(`🧭 [步骤] 正在通过 API 创建 Checkout (country=${region}, currency=${billingCurrency}, plan=${planType})...`);
 
-    // 设备绑定：从浏览器 context 取 oai-did Cookie，随请求头 oai-device-id 一并发送
+    // 设备绑定 + 会话 cookie 头：从浏览器 context 取
     let deviceId = '';
+    let cookieHeader = '';
     try {
         const cookies = await page.context().cookies('https://chatgpt.com').catch(() => []);
-        const oaiDid = (cookies || []).find((c) => c.name === 'oai-did');
+        const list = cookies || [];
+        const oaiDid = list.find((c) => c.name === 'oai-did');
         if (oaiDid && oaiDid.value) deviceId = oaiDid.value;
-    } catch (_) { /* 缺失时 oai-device-id 留空，不致命 */ }
+        cookieHeader = list.map((c) => `${c.name}=${c.value}`).join('; ');
+    } catch (_) { /* 缺失时留空，不致命 */ }
     if (deviceId) {
         console.log(`[ChatGPT] 设备绑定 oai-device-id: ${deviceId.slice(0, 8)}...`);
     } else {
@@ -460,11 +495,47 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
     const gpt = new ChatGPTService(page.context().request, token, { deviceId });
     const planName = String(planNameOverride || store.resolvePlanName(planType)).trim();
     const payload = buildCheckoutPayload(planName, region, billingCurrency);
-    console.log(`[ChatGPT] Checkout 实现版本: ${CHECKOUT_IMPL_VERSION} (transport=page, 真实 TLS)`);
+    console.log(`[ChatGPT] Checkout 实现版本: ${CHECKOUT_IMPL_VERSION} (transport=page, 真实 TLS + Sentinel)`);
+
+    // 前端上下文：attestation / client-version / build-number（实时抓页面）
+    let frontendContext = {};
+    try {
+        frontendContext = await bootstrapFrontendContext(page);
+        console.log(`[ChatGPT] 前端上下文: client-version=${frontendContext.clientVersion || '?'} attestation=${frontendContext.webDeploymentAttestation ? '有' : '无'}`);
+    } catch (e) {
+        console.warn(`[ChatGPT] 前端上下文提取失败: ${e.message}`);
+    }
+
+    // Sentinel PoW：Node 跑真实 sdk.js，产出 OpenAI-Sentinel-Token / So-Token
+    let sentinelHeaders = {};
+    try {
+        const ua = await page.evaluate(() => navigator.userAgent).catch(() => '');
+        const sentinel = await mintSentinelToken({
+            deviceId,
+            userAgent: ua,
+            flow: 'chatgpt_checkout',
+            proxy: proxyUrl,
+            cookieHeader,
+            pageUrl: 'https://chatgpt.com/',
+        });
+        sentinelHeaders['OpenAI-Sentinel-Token'] = sentinel.main;
+        sentinelHeaders['OAI-Telemetry'] = '[1,null]';
+        if (sentinel.so) sentinelHeaders['OpenAI-Sentinel-So-Token'] = sentinel.so;
+        console.log(`[ChatGPT] Sentinel 已生成 (main ${sentinel.main.length} 字符${sentinel.hasSo ? '，含 so-token' : ''})`);
+    } catch (e) {
+        console.warn(`[ChatGPT] Sentinel 生成失败（将不带 sentinel 直调，大概率被风控）: ${e.message}`);
+    }
+
+    const extraHeaders = {
+        ...(frontendContext.clientVersion ? { 'oai-client-version': frontendContext.clientVersion } : {}),
+        ...(frontendContext.clientBuildNumber ? { 'oai-client-build-number': frontendContext.clientBuildNumber } : {}),
+        ...(frontendContext.webDeploymentAttestation ? { 'oai-web-deployment-attestation': frontendContext.webDeploymentAttestation } : {}),
+        ...sentinelHeaders,
+    };
 
     let checkout = null;
-    // 首选：页面内 fetch → 真实 Chrome TLS + 真实浏览器头（官方接口契约）
-    const inPage = await createCheckoutViaPage(page, payload, token, deviceId);
+    // 首选：页面内 fetch → 真实 Chrome TLS + 真实浏览器头 + Sentinel/attestation（官方接口契约）
+    const inPage = await createCheckoutViaPage(page, payload, token, deviceId, extraHeaders);
     if (inPage.ok) {
         const parsed = parseCheckoutApiResponse(inPage.status, inPage.text);
         if (parsed.ok) {
