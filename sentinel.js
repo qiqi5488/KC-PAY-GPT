@@ -15,11 +15,24 @@ const BRIDGE_PATH = path.join(__dirname, 'sentinel', 'sentinel_bridge.js');
 const BRIDGE_VERSION = '20260219f9f6';
 
 /**
+ * curl 走 SOCKS5 时用 socks5h（远程 DNS），避免本地 DNS 泄漏/污染。
+ * 注意：这里应传原始 SOCKS5 代理 URL（如 socks5://user:pass@host:port），
+ * 而不是 proxy-chain 的本地 HTTP 中继——curl 走那个中继会 407 握手失败。
+ */
+function normalizeProxy(proxy) {
+    let p = String(proxy || '').trim();
+    if (/^socks5:\/\//i.test(p)) {
+        p = p.replace(/^socks5:\/\//i, 'socks5h://');
+    }
+    return p;
+}
+
+/**
  * @param {object} params
  * @param {string} params.deviceId - 与 oai-did cookie / oai-device-id 头一致的设备 ID
  * @param {string} params.userAgent - 浏览器 UA
  * @param {string} [params.flow]
- * @param {string} [params.proxy] - 本地 HTTP 中继地址（http://127.0.0.1:port）
+ * @param {string} [params.proxy] - 原始代理 URL（socks5/http），不要传 proxy-chain 本地中继
  * @param {string} [params.cookieHeader] - 会话 cookie 字符串
  * @param {string} [params.language]
  * @param {string} [params.timezone]
@@ -33,7 +46,7 @@ function mintSentinelToken(params, timeoutS = 120) {
         cores: params.cores || 16,
         deviceId: String(params.deviceId || '').trim(),
         flow: String(params.flow || 'chatgpt_checkout'),
-        proxy: String(params.proxy || '').trim(),
+        proxy: normalizeProxy(params.proxy),
         version: BRIDGE_VERSION,
         pageUrl: String(params.pageUrl || 'https://chatgpt.com/'),
         language: String(params.language || 'en-US'),

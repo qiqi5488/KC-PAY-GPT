@@ -557,7 +557,8 @@ async function run() {
                     currency: billingCurrency,
                     planNameOverride,
                     verifyPage: !debugOnly,
-                    proxyUrl: proxyConfig?.server || ''
+                    // Sentinel 需同 IP，传原始代理 URL（socks5），不走 proxy-chain 本地 HTTP 中继（curl 走中继会 407）
+                    proxyUrl: CONFIG.proxy || ''
                 });
                 checkoutOpened = true;
             } catch (apiError) {
