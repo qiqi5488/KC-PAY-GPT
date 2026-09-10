@@ -5,6 +5,32 @@ const store = require('./mysql-store');
 const { getRegionConfig } = require('./region-config');
 const { executePaymentWithRetry } = require('./payment-retry');
 
+// 与真实 Chrome 浏览器一致的指纹头，用于通过 OpenAI 风控引擎
+const BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36';
+
+/**
+ * 构造与浏览器请求一致的 headers（参考 subscription-check.js buildCheckHeaders）
+ * OpenAI /backend-api/* 风控引擎会检查这些指纹头，缺失会被判为“异常活动”
+ */
+function buildCheckoutHeaders(token, extra = {}) {
+    return {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+        'User-Agent': BROWSER_USER_AGENT,
+        Referer: 'https://chatgpt.com/',
+        Origin: 'https://chatgpt.com',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+        'sec-ch-ua': '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        ...extra
+    };
+}
+
 function buildCheckoutPayload(planName, country, currency) {
     const uiMode = String(process.env.CHECKOUT_UI_MODE || 'custom').trim() || 'custom';
     return {
@@ -77,11 +103,7 @@ async function createHostedCheckoutLink({ accessToken, planType = 'plus', planNa
         'https://chatgpt.com/backend-api/payments/checkout',
         payload,
         {
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                Accept: 'application/json'
-            },
+            headers: buildCheckoutHeaders(token),
             validateStatus: () => true,
             timeout: 30000
         }
@@ -124,15 +146,17 @@ class ChatGPTService {
     /**
      * @param {object} request - Playwright context.request 实例
      * @param {string} token - OpenAI Bearer Token
+     * @param {object} [options] - { deviceId?: string, extraHeaders?: object }
      */
-    constructor(request, token) {
+    constructor(request, token, options = {}) {
         this.request = request;
         this.token = token;
-        this.headers = {
-            "Authorization": `Bearer ${this.token}`,
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        };
+        const extra = { ...(options.extraHeaders || {}) };
+        const deviceId = String(options.deviceId || '').trim();
+        if (deviceId) {
+            extra['oai-device-id'] = deviceId;
+        }
+        this.headers = buildCheckoutHeaders(this.token, extra);
     }
 
     /**
@@ -391,7 +415,15 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
     const billingCurrency = String(currency || getRegionConfig(region)?.currency || 'PHP').toUpperCase();
     console.log(`🧭 [步骤] 正在通过 API 创建 Checkout (country=${region}, currency=${billingCurrency}, plan=${planType})...`);
 
-    const gpt = new ChatGPTService(page.context().request, token);
+    // 从浏览器 context 提取 oai-did 设备标识，随请求头一同发送，维持设备一致性
+    let deviceId = '';
+    try {
+        const cookies = await page.context().cookies('https://chatgpt.com').catch(() => []);
+        const oaiDid = (cookies || []).find((c) => c.name === 'oai-did');
+        if (oaiDid && oaiDid.value) deviceId = oaiDid.value;
+    } catch (_) { /* 忽略，缺失 oai-did 不致命 */ }
+
+    const gpt = new ChatGPTService(page.context().request, token, { deviceId });
     const checkout = await gpt.createCheckoutSession(planType, region, billingCurrency, planNameOverride);
     if (!checkout.checkoutUrl) {
         throw new Error(`API 创建 Checkout 失败: ${checkout.error || '未返回 data.url'}`);
