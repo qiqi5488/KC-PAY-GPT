@@ -5,32 +5,6 @@ const store = require('./mysql-store');
 const { getRegionConfig } = require('./region-config');
 const { executePaymentWithRetry } = require('./payment-retry');
 
-// 与真实 Chrome 浏览器一致的指纹头，用于通过 OpenAI 风控引擎
-const BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36';
-
-/**
- * 构造与浏览器请求一致的 headers（参考 subscription-check.js buildCheckHeaders）
- * OpenAI /backend-api/* 风控引擎会检查这些指纹头，缺失会被判为“异常活动”
- */
-function buildCheckoutHeaders(token, extra = {}) {
-    return {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
-        'User-Agent': BROWSER_USER_AGENT,
-        Referer: 'https://chatgpt.com/',
-        Origin: 'https://chatgpt.com',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-origin',
-        'sec-ch-ua': '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        ...extra
-    };
-}
-
 function buildCheckoutPayload(planName, country, currency) {
     const uiMode = String(process.env.CHECKOUT_UI_MODE || 'custom').trim() || 'custom';
     return {
@@ -39,72 +13,6 @@ function buildCheckoutPayload(planName, country, currency) {
         billing_details: { country, currency },
         checkout_ui_mode: uiMode
     };
-}
-
-// 部署校验标记：日志出现该版本号即代表新代码已生效
-const CHECKOUT_IMPL_VERSION = 'v3-device-headers';
-
-/**
- * 在真实浏览器页面内发起 Checkout 请求（关键修复）
- *
- * 为什么必须这样做：Playwright 的 context.request 由 Node.js 进程发出，
- * TLS(JA3/JA4) 与 HTTP/2 帧指纹均为 Node 客户端特征，无法用 HTTP 头伪造。
- * OpenAI 风控在网络层即可识别「自称 Chrome 但握手是 Node」→ 返回 400 unusual activity。
- *
- * 改为页面内 fetch 后，请求走 Chromium 真实网络栈，自动获得：
- * 真实 TLS/H2 指纹、真实 Referer/Origin/sec-fetch 头、真实 cookie（含 cf_clearance）
- */
-async function createCheckoutViaPage(page, payload, accessToken, deviceId) {
-    const token = String(accessToken || '').trim();
-    const did = String(deviceId || '').trim();
-    return page.evaluate(async (args) => {
-        try {
-            // 对齐 ChatGPT 前端 fetch 包装器：真实 App 调用 backend-api 时会带上 oai-device-id / oai-language
-            const headers = {
-                'Content-Type': 'application/json',
-                Accept: 'application/json',
-                'oai-language': 'en-US'
-            };
-            if (args.token) {
-                headers.Authorization = `Bearer ${args.token}`;
-            }
-            if (args.deviceId) {
-                headers['oai-device-id'] = args.deviceId;
-            }
-            const res = await fetch('https://chatgpt.com/backend-api/payments/checkout', {
-                method: 'POST',
-                headers,
-                credentials: 'include',
-                body: JSON.stringify(args.payload)
-            });
-            const text = await res.text();
-            // 回传响应头用于判断是 Cloudflare Bot Management 还是 OpenAI 应用层风控
-            const respHeaders = {};
-            try {
-                res.headers.forEach((value, key) => { respHeaders[String(key).toLowerCase()] = value; });
-            } catch (_) { /* 忽略 */ }
-            return { transport: 'page', ok: true, status: res.status, text, headers: respHeaders };
-        } catch (e) {
-            return { transport: 'page', ok: false, error: String((e && e.message) || e) };
-        }
-    }, { payload, token, deviceId: did });
-}
-
-/**
- * 真实感预热：把页面停在定价页，使 Referer/Origin 与真实用户点击升级时一致
- */
-async function warmupPricingPage(page) {
-    if (String(process.env.CHECKOUT_PAGE_WARMUP || '1') === '0') {
-        return;
-    }
-    try {
-        if (!/chatgpt\.com\/(pricing|#pricing)/.test(page.url())) {
-            await page.goto('https://chatgpt.com/pricing', { waitUntil: 'domcontentloaded', timeout: 60000 });
-            await page.waitForTimeout(1200 + Math.floor(Math.random() * 900));
-        }
-    } catch (_) {
-        // 预热失败不阻断主流程
-    }
 }
 
 function formatApiErrorDetail(detail, fallback = '') {
@@ -169,7 +77,11 @@ async function createHostedCheckoutLink({ accessToken, planType = 'plus', planNa
         'https://chatgpt.com/backend-api/payments/checkout',
         payload,
         {
-            headers: buildCheckoutHeaders(token),
+            headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                Accept: 'application/json'
+            },
             validateStatus: () => true,
             timeout: 30000
         }
@@ -212,17 +124,15 @@ class ChatGPTService {
     /**
      * @param {object} request - Playwright context.request 实例
      * @param {string} token - OpenAI Bearer Token
-     * @param {object} [options] - { deviceId?: string, extraHeaders?: object }
      */
-    constructor(request, token, options = {}) {
+    constructor(request, token) {
         this.request = request;
         this.token = token;
-        const extra = { ...(options.extraHeaders || {}) };
-        const deviceId = String(options.deviceId || '').trim();
-        if (deviceId) {
-            extra['oai-device-id'] = deviceId;
-        }
-        this.headers = buildCheckoutHeaders(this.token, extra);
+        this.headers = {
+            "Authorization": `Bearer ${this.token}`,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        };
     }
 
     /**
@@ -481,56 +391,8 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
     const billingCurrency = String(currency || getRegionConfig(region)?.currency || 'PHP').toUpperCase();
     console.log(`🧭 [步骤] 正在通过 API 创建 Checkout (country=${region}, currency=${billingCurrency}, plan=${planType})...`);
 
-    const planName = String(planNameOverride || store.resolvePlanName(planType)).trim();
-    const payload = buildCheckoutPayload(planName, region, billingCurrency);
-    const requestMode = String(process.env.CHECKOUT_REQUEST_MODE || 'page').toLowerCase();
-    console.log(`[ChatGPT] Checkout 实现版本: ${CHECKOUT_IMPL_VERSION} (transport=${requestMode})`);
-
-    let checkout = null;
-
-    // 设备标识：真实 App 每次 backend-api 调用都会带 oai-device-id，缺失本身就是异常信号
-    let deviceId = '';
-    try {
-        const cookies = await page.context().cookies('https://chatgpt.com').catch(() => []);
-        const oaiDid = (cookies || []).find((c) => c.name === 'oai-did');
-        if (oaiDid && oaiDid.value) deviceId = oaiDid.value;
-    } catch (_) { /* 忽略，缺失 oai-did 不致命 */ }
-    console.log(`[ChatGPT] oai-did: ${deviceId ? deviceId.slice(0, 8) + '...' : '未找到（将不带 oai-device-id 发送）'}`);
-
-    // --- 首选：页面内 fetch，走 Chromium 真实网络栈（TLS/H2 指纹真实） ---
-    if (requestMode !== 'node') {
-        await warmupPricingPage(page);
-        console.log(`[ChatGPT] 创建 Checkout Session(页面内 fetch): plan_name=${planName}, country=${region}, currency=${billingCurrency}, checkout_ui_mode=${payload.checkout_ui_mode}`);
-        const inPage = await createCheckoutViaPage(page, payload, token, deviceId);
-
-        if (inPage.ok) {
-            const parsed = parseCheckoutApiResponse(inPage.status, inPage.text);
-            if (parsed.ok) {
-                console.log(`✅ 订单创建成功 (session: ${parsed.sessionId ? parsed.sessionId.slice(0, 24) + '...' : 'unknown'})`);
-                checkout = { sessionId: parsed.sessionId, checkoutUrl: parsed.checkoutUrl };
-            } else {
-                // 风控/业务拒绝：不再回退重发，避免叠加风险标记
-                console.error(`[-] 订单创建失败 (Status: ${parsed.status}, transport=page)`);
-                console.error(`    响应: ${parsed.error}`);
-                const h = inPage.headers || {};
-                const interesting = ['cf-mitigated', 'cf-ray', 'cf-cache-status', 'x-request-id', 'server', 'content-type']
-                    .map((k) => (h[k] ? `${k}=${h[k]}` : null)).filter(Boolean);
-                console.error(`    拦截层: ${h['cf-mitigated'] ? 'Cloudflare Bot Management (cf-mitigated)' : (h['cf-ray'] ? '经 Cloudflare 但无 mitigated 头 → OpenAI 应用层风控' : '未见 Cloudflare 头 → OpenAI 应用层风控')}`);
-                console.error(`    响应头: ${interesting.join(', ') || '(无诊断头)'}`);
-                console.error(`    当前页面: ${String(page.url() || '').slice(0, 120)}`);
-                checkout = { sessionId: null, checkoutUrl: null, error: parsed.error };
-            }
-        } else {
-            console.warn(`[Warn] 页面内 fetch 异常，回退 Node 请求: ${inPage.error}`);
-        }
-    }
-
-    // --- 回退：Node 侧请求（旧实现，仅在页面内请求本身抛错时使用） ---
-    if (!checkout) {
-        const gpt = new ChatGPTService(page.context().request, token, { deviceId });
-        checkout = await gpt.createCheckoutSession(planType, region, billingCurrency, planNameOverride);
-    }
-
+    const gpt = new ChatGPTService(page.context().request, token);
+    const checkout = await gpt.createCheckoutSession(planType, region, billingCurrency, planNameOverride);
     if (!checkout.checkoutUrl) {
         throw new Error(`API 创建 Checkout 失败: ${checkout.error || '未返回 data.url'}`);
     }

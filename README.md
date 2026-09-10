@@ -235,28 +235,6 @@ PROXY=http://user:pass@proxy-host:port
 HEADFUL=0          # 调试时可设为 1 开启有头浏览器
 ```
 
-#### 可选：接入外部指纹浏览器（绕过无头 Chromium 风控）
-
-> 适用场景：脚本自带无头 Chromium 创建 Checkout 时被 OpenAI 风控拦截
-> （`Our systems have detected unusual activity`），而用指纹浏览器（AdsPower /
-> BitBrowser / 候鸟 / 紫鸟等）+ 住宅代理手动操作正常。此时可让自动化直连
-> 指纹浏览器的 CDP 端口，在真实浏览器环境内执行，彻底规避无头指纹问题。
-
-```env
-# 指纹浏览器 profile 的 CDP 地址（http:// 或 ws:// 均可）
-# 同机 Docker Desktop / 宿主机：EXTERNAL_BROWSER_CDP_URL=http://host.docker.internal:<端口>
-# 同机 Linux 容器（compose 已配 extra_hosts）：同上
-EXTERNAL_BROWSER_CDP_URL=http://127.0.0.1:9527
-```
-
-要点：
-
-1. 指纹浏览器需**保持运行**且已配置好代理（脚本不再配置代理，代理由指纹浏览器承担）；
-2. 设置 `EXTERNAL_BROWSER_CDP_URL` 后，所有任务自动走外部浏览器模式（优先级高于
-   浏览器池/独立模式），日志会出现 `浏览器模式: 外部指纹浏览器 CDP=...`；
-3. 脚本不再注入 WebGL/Canvas 等指纹伪装，避免与指纹浏览器自身指纹冲突；
-4. 任务结束时不会关闭指纹浏览器（`ownsBrowser=false`）。
-
 **⑥ 启动服务**
 
 ```bash

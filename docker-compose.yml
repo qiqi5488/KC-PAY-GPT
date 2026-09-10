@@ -39,9 +39,6 @@ services:
         condition: service_healthy
     ports:
       - "${PORT:-3100}:3000"
-    # 允许容器经 host.docker.internal 访问宿主机（指纹浏览器 CDP 常绑定 127.0.0.1）
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
       PORT: 3000
       DB_HOST: mysql
@@ -66,7 +63,6 @@ services:
       BROWSER_POOL_SIZE: ${BROWSER_POOL_SIZE:-2}
       BROWSER_POOL_MAX_SIZE: ${BROWSER_POOL_MAX_SIZE:-24}
       BROWSER_POOL_BASE_PORT: ${BROWSER_POOL_BASE_PORT:-19222}
-      EXTERNAL_BROWSER_CDP_URL: ${EXTERNAL_BROWSER_CDP_URL:-}
     volumes:
       - ./debug_screenshots:/app/debug_screenshots
       - ./data:/app/data
@@ -94,7 +90,6 @@ services:
       - ./browser-pool-client.js:/app/browser-pool-client.js
       - ./browser-standalone.js:/app/browser-standalone.js
       - ./browser-runtime.js:/app/browser-runtime.js
-      - ./browser-external.js:/app/browser-external.js
       - ./admin-auth.js:/app/admin-auth.js
       - ./admin-paths.js:/app/admin-paths.js
       - ./gpt-api-client.js:/app/gpt-api-client.js
