@@ -63,6 +63,7 @@ services:
       BROWSER_POOL_SIZE: ${BROWSER_POOL_SIZE:-2}
       BROWSER_POOL_MAX_SIZE: ${BROWSER_POOL_MAX_SIZE:-24}
       BROWSER_POOL_BASE_PORT: ${BROWSER_POOL_BASE_PORT:-19222}
+      CHECKOUT_DEBUG_UI_FALLBACK: ${CHECKOUT_DEBUG_UI_FALLBACK:-0}
     volumes:
       - ./debug_screenshots:/app/debug_screenshots
       - ./data:/app/data
