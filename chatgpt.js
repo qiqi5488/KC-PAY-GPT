@@ -1,5 +1,6 @@
 'use strict';
 
+const { randomUUID } = require('crypto');
 const axios = require('axios');
 const store = require('./mysql-store');
 const { getRegionConfig } = require('./region-config');
@@ -62,7 +63,7 @@ function parseCheckoutApiResponse(status, bodyText) {
 /**
  * 使用 axios 直接调用 Checkout API（供后台调试 / 无 Playwright 场景）
  */
-async function createHostedCheckoutLink({ accessToken, planType = 'plus', planName, country, currency }) {
+async function createHostedCheckoutLink({ accessToken, planType = 'plus', planName, country, currency, deviceId }) {
     const token = String(accessToken || '').trim();
     if (!token) {
         return { success: false, error: '缺少 AccessToken' };
@@ -72,6 +73,7 @@ async function createHostedCheckoutLink({ accessToken, planType = 'plus', planNa
     const billingCurrency = String(currency || getRegionConfig(region)?.currency || 'PHP').toUpperCase();
     const planNameResolved = String(planName || store.resolvePlanName(planType)).trim();
     const payload = buildCheckoutPayload(planNameResolved, region, billingCurrency);
+    const resolvedDeviceId = String(deviceId || '').trim();
 
     const response = await axios.post(
         'https://chatgpt.com/backend-api/payments/checkout',
@@ -80,7 +82,10 @@ async function createHostedCheckoutLink({ accessToken, planType = 'plus', planNa
             headers: {
                 Authorization: `Bearer ${token}`,
                 'Content-Type': 'application/json',
-                Accept: 'application/json'
+                Accept: 'application/json',
+                'oai-language': 'en-US',
+                'oai-session-id': randomUUID(),
+                ...(resolvedDeviceId ? { 'oai-device-id': resolvedDeviceId } : {})
             },
             validateStatus: () => true,
             timeout: 30000
@@ -124,15 +129,22 @@ class ChatGPTService {
     /**
      * @param {object} request - Playwright context.request 实例
      * @param {string} token - OpenAI Bearer Token
+     * @param {object} [options] - { deviceId?: string }
      */
-    constructor(request, token) {
+    constructor(request, token, options = {}) {
         this.request = request;
         this.token = token;
+        const deviceId = String(options.deviceId || '').trim();
         this.headers = {
             "Authorization": `Bearer ${this.token}`,
             "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "oai-language": "en-US",
+            "oai-session-id": randomUUID()
         };
+        if (deviceId) {
+            this.headers["oai-device-id"] = deviceId;
+        }
     }
 
     /**
@@ -391,7 +403,20 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
     const billingCurrency = String(currency || getRegionConfig(region)?.currency || 'PHP').toUpperCase();
     console.log(`🧭 [步骤] 正在通过 API 创建 Checkout (country=${region}, currency=${billingCurrency}, plan=${planType})...`);
 
-    const gpt = new ChatGPTService(page.context().request, token);
+    // 设备绑定：从浏览器 context 取 oai-did Cookie，随请求头 oai-device-id 一并发送
+    let deviceId = '';
+    try {
+        const cookies = await page.context().cookies('https://chatgpt.com').catch(() => []);
+        const oaiDid = (cookies || []).find((c) => c.name === 'oai-did');
+        if (oaiDid && oaiDid.value) deviceId = oaiDid.value;
+    } catch (_) { /* 缺失时 oai-device-id 留空，不致命 */ }
+    if (deviceId) {
+        console.log(`[ChatGPT] 设备绑定 oai-device-id: ${deviceId.slice(0, 8)}...`);
+    } else {
+        console.warn('[ChatGPT] 未找到 oai-did Cookie，checkout 请求将不带 oai-device-id（可能触发风控）');
+    }
+
+    const gpt = new ChatGPTService(page.context().request, token, { deviceId });
     const checkout = await gpt.createCheckoutSession(planType, region, billingCurrency, planNameOverride);
     if (!checkout.checkoutUrl) {
         throw new Error(`API 创建 Checkout 失败: ${checkout.error || '未返回 data.url'}`);

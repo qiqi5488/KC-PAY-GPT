@@ -1,5 +1,7 @@
 'use strict';
 
+const { randomUUID } = require('crypto');
+
 const CHATGPT_ORIGIN = 'https://chatgpt.com';
 const {
     isLoginRedirectUrl,
@@ -336,9 +338,13 @@ function collectCookieSpecs(sessionData, sessionJson) {
         push('__Host-next-auth.csrf-token', csrfToken);
     }
 
-    const deviceId = String(sessionData?.deviceId || sessionData?.device_id || sessionData?.['oai-did'] || '').trim();
-    if (deviceId && !seenNames.has('oai-did')) {
+    // 设备绑定：ChatGPT 支付风控要求 checkout 请求携带与登录一致的 oai-device-id。
+    // 优先复用 sessionData 里的设备标识；缺失时生成新 UUID 写为 oai-did Cookie（.chatgpt.com 域）。
+    const providedDeviceId = String(sessionData?.deviceId || sessionData?.device_id || sessionData?.['oai-did'] || '').trim();
+    const deviceId = providedDeviceId || randomUUID();
+    if (!seenNames.has('oai-did')) {
         push('oai-did', deviceId);
+        console.log(`[Session] oai-did 注入: ${deviceId.slice(0, 8)}...${providedDeviceId ? '（来自 sessionData）' : '（缺失，已生成新 UUID）'}`);
     }
 
     return specs;
