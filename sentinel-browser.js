@@ -212,7 +212,7 @@ async function mintSentinelTokenInPage(page, params) {
         bootstrapSrc: BOOTSTRAP_SRC,
         sdkSrc: SDK_SRC,
         ua, cores, deviceId, flow, language, timezone, pageUrl, version: BRIDGE_VERSION,
-    });
+    }, { timeout: Number(params.timeoutMs) || 25000 });
 
     let rd;
     try {
