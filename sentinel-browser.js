@@ -167,7 +167,7 @@ async function mintSentinelTokenInPage(page, params) {
     const timezone = String(params.timezone || 'Asia/Manila');
     const pageUrl = String(params.pageUrl || 'https://chatgpt.com/');
 
-    const driverJson = await page.evaluate(async (args) => {
+    const evaluatePromise = page.evaluate(async (args) => {
         const iframe = document.createElement('iframe');
         iframe.style.display = 'none';
         iframe.srcdoc = '<!DOCTYPE html><html><head></head><body></body></html>';
@@ -212,7 +212,19 @@ async function mintSentinelTokenInPage(page, params) {
         bootstrapSrc: BOOTSTRAP_SRC,
         sdkSrc: SDK_SRC,
         ua, cores, deviceId, flow, language, timezone, pageUrl, version: BRIDGE_VERSION,
-    }, { timeout: Number(params.timeoutMs) || 25000 });
+    });
+
+    // Playwright evaluate 不接受 options 参数，用 Promise.race 实现超时，
+    // 避免 iframe 内 sdk 卡死时拖满 180 秒无输出保护。
+    const timeoutMs = Number(params.timeoutMs) || 25000;
+    let timer = null;
+    const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`页面内 Sentinel 超时(${timeoutMs}ms)`)), timeoutMs);
+        if (timer.unref) timer.unref();
+    });
+    const driverJson = await Promise.race([evaluatePromise, timeoutPromise]).finally(() => {
+        if (timer) clearTimeout(timer);
+    });
 
     let rd;
     try {
