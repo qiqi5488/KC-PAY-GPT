@@ -6,7 +6,6 @@ const store = require('./mysql-store');
 const { getRegionConfig } = require('./region-config');
 const { executePaymentWithRetry } = require('./payment-retry');
 const { mintSentinelToken } = require('./sentinel');
-const { mintSentinelTokenInPage } = require('./sentinel-browser');
 
 function buildCheckoutPayload(planName, country, currency) {
     const uiMode = String(process.env.CHECKOUT_UI_MODE || 'custom').trim() || 'custom';
@@ -507,36 +506,22 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
         console.warn(`[ChatGPT] 前端上下文提取失败: ${e.message}`);
     }
 
-    // Sentinel PoW：优先在浏览器页面内跑真实 sdk.js（Chrome TLS 与 checkout 一致），
-    // 失败降级为 Node bridge（curl/SOCKS5 直连）。
+    // Sentinel PoW：Node bridge 跑真实 sdk.js（curl 走 SOCKS5 直连）
     let sentinelHeaders = {};
     try {
         const ua = await page.evaluate(() => navigator.userAgent).catch(() => '');
-        let sentinel;
-        try {
-            sentinel = await mintSentinelTokenInPage(page, {
-                deviceId,
-                userAgent: ua,
-                flow: 'chatgpt_checkout',
-                pageUrl: 'https://chatgpt.com/',
-            });
-            console.log(`[ChatGPT] Sentinel 已生成（页面内，真实 Chrome TLS）`);
-        } catch (inPageErr) {
-            console.warn(`[ChatGPT] 页面内 Sentinel 失败（${String(inPageErr.message).slice(0, 120)}），降级 Node bridge`);
-            sentinel = await mintSentinelToken({
-                deviceId,
-                userAgent: ua,
-                flow: 'chatgpt_checkout',
-                proxy: proxyUrl,
-                cookieHeader,
-                pageUrl: 'https://chatgpt.com/',
-            });
-            console.log(`[ChatGPT] Sentinel 已生成（Node bridge 降级）`);
-        }
+        const sentinel = await mintSentinelToken({
+            deviceId,
+            userAgent: ua,
+            flow: 'chatgpt_checkout',
+            proxy: proxyUrl,
+            cookieHeader,
+            pageUrl: 'https://chatgpt.com/',
+        });
         sentinelHeaders['OpenAI-Sentinel-Token'] = sentinel.main;
         sentinelHeaders['OAI-Telemetry'] = '[1,null]';
         if (sentinel.so) sentinelHeaders['OpenAI-Sentinel-So-Token'] = sentinel.so;
-        console.log(`[ChatGPT] Sentinel main ${sentinel.main.length} 字符${sentinel.hasSo ? '，含 so-token' : ''}`);
+        console.log(`[ChatGPT] Sentinel 已生成 (main ${sentinel.main.length} 字符${sentinel.hasSo ? '，含 so-token' : ''})`);
     } catch (e) {
         console.warn(`[ChatGPT] Sentinel 生成失败（将不带 sentinel 直调，大概率被风控）: ${e.message}`);
     }
